@@ -120,6 +120,39 @@ def find_program(basename):
             return path
 
 
+def pe_machine(path):
+    """Read the PE machine without loading an untrusted/cross-architecture DLL."""
+    with open(path, "rb") as stream:
+        if stream.read(2) != b"MZ":
+            return None
+        stream.seek(0x3C)
+        offset = stream.read(4)
+        if len(offset) != 4:
+            return None
+        stream.seek(int.from_bytes(offset, "little"))
+        if stream.read(4) != b"PE\0\0":
+            return None
+        machine = stream.read(2)
+        return int.from_bytes(machine, "little") if len(machine) == 2 else None
+
+
+def find_cuda_dll(library, binary):
+    """Find a matching runtime in CUDA's native-architecture or legacy bin."""
+    machine = pe_machine(binary)
+    architecture = {0xAA64: "arm64", 0x8664: "x64"}.get(machine)
+    if architecture is None:
+        return None
+    for variable in ("CUDA_PATH", "CUDA_HOME"):
+        root = os.environ.get(variable)
+        if not root:
+            continue
+        for directory in (osp.join(root, "bin", architecture), osp.join(root, "bin")):
+            candidate = osp.join(directory, library)
+            if osp.isfile(candidate) and pe_machine(candidate) == machine:
+                return candidate
+    return None
+
+
 def patch_new_path(library_path, new_dir):
     library = osp.basename(library_path)
     name, *rest = library.split(".")
@@ -249,7 +282,16 @@ def relocate_dll_library(dumpbin, output_dir, output_library, binary):
             print(f"Omitting {library}")
             continue
 
-        library_path = find_program(library)
+        bundled_path = osp.join(output_library, library)
+        library_path = bundled_path if osp.isfile(bundled_path) else find_program(library)
+        if library.lower().startswith("nvjpeg") and library.lower().endswith(".dll"):
+            if library_path is None or pe_machine(library_path) != pe_machine(binary_path):
+                library_path = find_cuda_dll(library, binary_path)
+            if library_path is None:
+                raise FileNotFoundError(
+                    f"Required {library} for {binary_path} was not found with matching PE architecture. "
+                    "Set CUDA_PATH or CUDA_HOME to a matching toolkit; refusing to emit an incomplete wheel."
+                )
         if library_path is None:
             print(f"{library} not found")
             continue
@@ -276,7 +318,8 @@ def relocate_dll_library(dumpbin, output_dir, output_library, binary):
             library_path = binary_paths[library]
             new_library_path = osp.join(package_dir, library)
             print(f"{library} -> {new_library_path}")
-            shutil.copyfile(library_path, new_library_path)
+            if not osp.exists(new_library_path) or not osp.samefile(library_path, new_library_path):
+                shutil.copyfile(library_path, new_library_path)
 
 
 def compress_wheel(output_dir, wheel, wheel_dir, wheel_name):
@@ -289,7 +332,7 @@ def compress_wheel(output_dir, wheel, wheel_dir, wheel_name):
         for root, _, files in os.walk(output_dir):
             for this_file in files:
                 full_file = osp.join(root, this_file)
-                rel_file = osp.relpath(full_file, output_dir)
+                rel_file = osp.relpath(full_file, output_dir).replace(os.sep, "/")
                 if full_file == record_file:
                     f.write(f"{rel_file},,\n")
                 else:
